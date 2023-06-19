@@ -165,6 +165,11 @@ class Client(object):
         payload = Wsman.power_state_request(self.uri, "reset")
         return self.post(payload, CIM_PowerManagementService)
 
+    def power_sleep(self):
+        """Power sleep the box."""
+        payload = Wsman.power_state_request(self.uri, "standby")
+        return self.post(payload, CIM_PowerManagementService)
+
     def power_status(self):
         payload = Wsman.get_request(
             self.uri,
@@ -401,6 +406,8 @@ def handle_single_server(server, args, db, i, status_line):
             client.power_cycle()
         elif args.command == "reset":
             client.power_reset()
+        elif args.command == "standby":
+            client.power_sleep()
         elif args.command == "status":
             power_state = Wsman.friendly_power_state(client.power_status())
             color = STATUS_COLORS.get(power_state, 'white')
