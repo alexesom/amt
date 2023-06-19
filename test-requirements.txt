@@ -1,4 +1,0 @@
-fixtures
-mock
-pytest
-testtools

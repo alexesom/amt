@@ -1,16 +1,284 @@
 #!/usr/bin/env python
 
 import argparse
+import concurrent.futures
 import os
+import signal
 import sys
+import threading
+import time
+import uuid
+import xml.dom.minidom
+from xml.etree import ElementTree
 
+import appdirs
 import requests
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPDigestAuth
+from six.moves import configparser
+from termcolor import colored
+from urllib3 import Retry
 
-import amt.client
-import amt.hostdb
-import amt.wsman
+"""CIM schema urls
+
+Conceptually you can query a Service, everything else is for update
+only or modeling only. And, yes this is as redundant as it looks.
+"""
+SCHEMA_BASE = 'http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/'
+CIM_AssociatedPowerManagementService = (SCHEMA_BASE + 'CIM_AssociatedPowerManagementService')
+CIM_PowerManagementService = (SCHEMA_BASE + 'CIM_PowerManagementService')
+CIM_BootService = SCHEMA_BASE + 'CIM_BootService'
+CIM_SoftwareIdentity = SCHEMA_BASE + 'CIM_SoftwareIdentity'  # TODO: future version AMT check
+
+AMT_PROTOCOL_PORT_MAP = {
+    'http': 16992,
+    'https': 16993,
+}
 
 RESERVE_WORDS = ['list', 'get', 'add', 'set', 'rm']
+appauthor = "sdague-alexesom"
+appname = "amtctrl"
+
+STATUS_COLORS = {
+    'on': 'green',
+    'off': 'red',
+    'standby': 'yellow',
+    'reboot': 'cyan',
+    'hibernate': 'blue',
+    'reset': 'magenta',
+}
+
+exit_event = threading.Event()
+
+
+class HostDB(object):
+    def __init__(self):
+        self.confdir = appdirs.user_config_dir(appname, appauthor)
+        self.confname = os.path.join(self.confdir, 'hosts.cfg')
+        self.config = configparser.ConfigParser()
+        self.config.read(self.confname)
+
+    def list_servers(self):
+        print("Available servers (%d):" % len(self.config.sections()))
+        for item in self.config.sections():
+            print("    %s" % item)
+
+    def set_server(self, name, host, passwd):
+        # This is add/update
+        if not self.config.has_section(name):
+            self.config.add_section(name)
+
+        self.config.set(name, 'host', host)
+        self.config.set(name, 'passwd', passwd)
+
+        # ensure the directory exists
+        if not os.path.exists(self.confdir):
+            os.makedirs(self.confdir, 0o770)
+
+        with open(self.confname, 'w') as f:
+            self.config.write(f)
+
+    def rm_server(self, name):
+        self.config.remove_section(name)
+
+        with open(self.confname, 'w') as f:
+            self.config.write(f)
+
+    def get_server(self, name):
+        if self.config.has_section(name):
+            data = {
+                'host': self.config.get(name, 'host'),
+                'passwd': self.config.get(name, 'passwd'),
+            }
+
+            return data
+        else:
+            print("No config found for server (%s), "
+                  "perhaps you need to add one via ``amtctrl set``" % name)
+
+
+class Client(object):
+    """AMT client.
+
+    Manage interactions with AMT host.
+    """
+
+    def __init__(self, address, password,
+                 username='admin', protocol='http'):
+        port = AMT_PROTOCOL_PORT_MAP[protocol]
+        path = '/wsman'
+        self.uri = f"{protocol}://{address}:{port}{path}"
+        self.username = username
+        self.password = password
+        self.session = requests.Session()
+        retries = Retry(total=8,
+                        backoff_factor=0.1,
+                        status_forcelist=[500, 502, 503, 504])
+        self.session.mount(f'{protocol}://', HTTPAdapter(max_retries=retries))
+
+    def pp_xml(self, body):
+        """Pretty print format some XML so it's readable."""
+        pretty = xml.dom.minidom.parseString(body)
+        return pretty.toprettyxml(indent="  ")
+
+    def post(self, payload, ns=None):
+        try:
+            resp = self.session.post(self.uri,
+                                     headers={'content-type': 'application/soap+xml;charset=UTF-8'},
+                                     auth=HTTPDigestAuth(self.username, self.password),
+                                     data=payload)
+            resp.raise_for_status()
+            if ns:
+                rv = self.return_value(resp.content, ns)
+                if rv == 0:
+                    return 0
+                # print(self.pp_xml(resp.content))
+                print("Unknown or Unspecified Error")
+            else:
+                return 0
+        except requests.exceptions.HTTPError as errh:
+            print("Http Error:", errh)
+        except requests.exceptions.ConnectionError as errc:
+            print("Error Connecting:", errc)
+        except requests.exceptions.Timeout as errt:
+            print("Timeout Error:", errt)
+        except requests.exceptions.RequestException as err:
+            print("Something Else", err)
+
+    def power_on(self):
+        """Power on the box."""
+        payload = Wsman.power_state_request(self.uri, "on")
+        return self.post(payload, CIM_PowerManagementService)
+
+    def power_off(self):
+        """Power off the box."""
+        payload = Wsman.power_state_request(self.uri, "off")
+        return self.post(payload, CIM_PowerManagementService)
+
+    def power_cycle(self):
+        """Power cycle the box."""
+        payload = Wsman.power_state_request(self.uri, "reboot")
+        return self.post(payload, CIM_PowerManagementService)
+
+    def power_reset(self):
+        """Power reset the box."""
+        payload = Wsman.power_state_request(self.uri, "reset")
+        return self.post(payload, CIM_PowerManagementService)
+
+    def power_status(self):
+        payload = Wsman.get_request(
+            self.uri,
+            CIM_AssociatedPowerManagementService)
+        try:
+            resp = self.session.post(self.uri,
+                                     auth=HTTPDigestAuth(self.username, self.password),
+                                     data=payload)
+            resp.raise_for_status()
+            value = self.find_value(
+                resp.content,
+                CIM_AssociatedPowerManagementService,
+                "PowerState")
+            return value
+        except requests.exceptions.HTTPError as errh:
+            print("Http Error:", errh)
+        except requests.exceptions.ConnectionError as errc:
+            print("Error Connecting:", errc)
+        except requests.exceptions.Timeout as errt:
+            print("Timeout Error:", errt)
+        except requests.exceptions.RequestException as err:
+            print("Something Else", err)
+
+    def find_value(self, content, ns, key):
+        """Find the return value in a CIM response.
+
+        The xmlns is needed because everything in CIM is a million levels
+        of namespace indirection.
+        """
+        doc = ElementTree.fromstring(content)
+        query = './/{%(ns)s}%(item)s' % {'ns': ns, 'item': key}
+        rv = doc.find(query)
+        return rv.text
+
+    def return_value(self, content, ns):
+        """Find the return value in a CIM response.
+
+        The xmlns is needed because everything in CIM is a million levels
+        of namespace indirection.
+        """
+        doc = ElementTree.fromstring(content)
+        query = './/{%(ns)s}%(item)s' % {'ns': ns, 'item': 'ReturnValue'}
+        rv = doc.find(query)
+        return int(rv.text)
+
+
+class Wsman(object):
+    POWER_STATES = {
+        'on': 2,
+        'off': 8,
+        'standby': 4,
+        'reboot': 5,
+        'hibernate': 7,
+        'reset': 10,
+    }
+
+    FRIENDLY_POWER_STATE = {v: k for (k, v) in POWER_STATES.items()}
+
+    @staticmethod
+    def friendly_power_state(state):
+        return Wsman.FRIENDLY_POWER_STATE.get(int(state), 'unknown')
+
+    @staticmethod
+    def get_request(uri, resource):
+        stub = """<?xml version="1.0" encoding="UTF-8"?>
+    <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd">
+       <s:Header>
+           <wsa:Action s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/09/transfer/Get</wsa:Action>
+           <wsa:To s:mustUnderstand="true">%(uri)s</wsa:To>
+           <wsman:ResourceURI s:mustUnderstand="true">%(resource)s</wsman:ResourceURI>
+           <wsa:MessageID s:mustUnderstand="true">uuid:%(uuid)s</wsa:MessageID>
+           <wsa:ReplyTo>
+               <wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address>
+           </wsa:ReplyTo>
+       </s:Header>
+       <s:Body/>
+    </s:Envelope>
+    """
+        return stub % {'uri': uri, 'resource': resource, 'uuid': uuid.uuid4()}
+
+    @staticmethod
+    def power_state_request(uri, power_state):
+        stub = """<?xml version="1.0" encoding="UTF-8"?>
+        <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:n1="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_PowerManagementService">
+        <s:Header>
+        <wsa:Action s:mustUnderstand="true">http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_PowerManagementService/RequestPowerStateChange</wsa:Action>
+        <wsa:To s:mustUnderstand="true">%(uri)s</wsa:To>
+        <wsman:ResourceURI s:mustUnderstand="true">http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_PowerManagementService</wsman:ResourceURI>
+        <wsa:MessageID s:mustUnderstand="true">uuid:%(uuid)s</wsa:MessageID>
+        <wsa:ReplyTo>
+            <wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address>
+        </wsa:ReplyTo>
+        <wsman:SelectorSet>
+           <wsman:Selector Name="Name">Intel(r) AMT Power Management Service</wsman:Selector>
+        </wsman:SelectorSet>
+        </s:Header>
+        <s:Body>
+          <n1:RequestPowerStateChange_INPUT>
+            <n1:PowerState>%(power_state)d</n1:PowerState>
+            <n1:ManagedElement>
+              <wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address>
+              <wsa:ReferenceParameters>
+                 <wsman:ResourceURI>http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ComputerSystem</wsman:ResourceURI>
+                 <wsman:SelectorSet>
+                    <wsman:Selector wsman:Name="Name">ManagedSystem</wsman:Selector>
+                 </wsman:SelectorSet>
+               </wsa:ReferenceParameters>
+             </n1:ManagedElement>
+           </n1:RequestPowerStateChange_INPUT>
+          </s:Body></s:Envelope>
+    """
+        return stub % {'uri': uri,
+                       'power_state': Wsman.POWER_STATES[power_state],
+                       'uuid': uuid.uuid4()}
 
 
 def parse_args():
@@ -27,7 +295,7 @@ Host DB Commands
 ----------------
 
 amtctrl list - list all servers registered
-amtctrl set [-V vncpasswd] <name> <ip> <passwd> - register a server
+amtctrl set <name> <ip> <passwd> - register a server
 amtctrl rm <name> - unregister a server
 amtctrl get <name> - return info for the server
 
@@ -41,12 +309,10 @@ command is one of:
   on - power on
   off - power off
   reboot - reboot
-  pxeboot - reboot the machine and pxeboot on the next reboot cycle
   status - dump cim power status
-  vnc - enable vnc on the server
 """))
 
-    parser.add_argument('server', metavar='name',
+    parser.add_argument('servers', metavar='name',
                         help='')
     parser.add_argument('-p', '--prompt-pass',
                         dest='prompt', action='store_true',
@@ -66,8 +332,6 @@ def parse_args_set():
     parser.add_argument('host', metavar='host',
                         help='')
     parser.add_argument('passwd', metavar='passwd',
-                        help='')
-    parser.add_argument("-V", '--vncpasswd', metavar='vncpasswd',
                         help='')
     return parser.parse_args()
 
@@ -91,49 +355,43 @@ def parse_args_get():
 
 
 def do_db_actions(args, db):
-    if args.server == 'list':
+    if args.servers == 'list':
         return db.list_servers()
-    elif args.server == 'add' or args.server == 'set':
-        if args.server == 'add':
+    elif args.servers == 'add' or args.servers == 'set':
+        if args.servers == 'add':
             print("WARNING: ``add`` command is deprecated, ``set`` "
                   "is prefered")
         set_args = parse_args_set()
-        return db.set_server(set_args.name, set_args.host, set_args.passwd,
-                             set_args.vncpasswd)
-    elif args.server == 'rm':
+        return db.set_server(set_args.name, set_args.host, set_args.passwd)
+    elif args.servers == 'rm':
         rm_args = parse_args_rm()
         return db.rm_server(rm_args.name)
-    elif args.server == 'get':
+    elif args.servers == 'get':
         get_args = parse_args_get()
-        server = db.get_server(get_args.name)
-        print("%s => %s" % (get_args.name, server['host']))
+        servers = db.get_server(get_args.name)
+        print("%s => %s" % (get_args.name, servers['host']))
 
 
-def main():
-    args = parse_args()
-    db = amt.hostdb.HostDB()
+lock = threading.Lock()
 
-    # if the "server" name is reserve word, run that command
-    if args.server in RESERVE_WORDS:
-        return do_db_actions(args, db)
 
+def handle_single_server(server, args, db, i, status_line):
     if args.prompt:
-        host = args.server
+        host = server
         if sys.stdin.isatty():
             from getpass import getpass
             passwd = getpass()
         else:
             passwd = sys.stdin.readline().rstrip('\r\n')
     else:
-        server = db.get_server(args.server)
-        if not server:
-            print("Server %s not found in hostdb" % args.server)
+        server_info = db.get_server(server)
+        if not server_info:
+            print("Server %s not found in hostdb" % server)
             return 1
-        host = server['host']
-        passwd = server['passwd']
-        vncpasswd = server['vncpasswd']
+        host = server_info['host']
+        passwd = server_info['passwd']
 
-    client = amt.client.Client(host, passwd, vncpasswd=vncpasswd)
+    client = Client(host, passwd)
     try:
         if args.command == "on":
             client.power_on()
@@ -141,23 +399,75 @@ def main():
             client.power_off()
         elif args.command == "reboot":
             client.power_cycle()
-        elif args.command == "pxeboot":
-            client.pxe_next_boot()
-            client.power_cycle()
+        elif args.command == "reset":
+            client.power_reset()
         elif args.command == "status":
-            print(amt.wsman.friendly_power_state(client.power_status()))
-        elif args.command == "vnc":
-            if client.enable_vnc():
-                print("VNC enabled on port 5900 with AMT password")
-        elif args.command == "vncstatus":
-            print(client.vnc_status())
+            power_state = Wsman.friendly_power_state(client.power_status())
+            color = STATUS_COLORS.get(power_state, 'white')
+
+            if exit_event.is_set():
+                return
+
+            with lock:
+                status_line[i] = colored(f"{server}", color)  # Update status of server i
+                print('\r', end='')  # Move cursor back to start of line
+                print(f"\033[K", end='')  # Clear to end of line
+                print(" ".join(status_line), end='')  # Print the complete status_line
+                time.sleep(0.1)  # Give the console some time to update before releasing the lock
         else:
             print(("Unknown command %s"
-                   "try one of on, off, reboot, pxeboot, "
-                   "status, vnc, vncstatus")
+                   "try one of on/off/reboot/reset "
+                   "status")
                   % args.command)
+
     except requests.exceptions.HTTPError as e:
         print("Error: %s" % e)
+
+
+def main():
+    args = parse_args()
+    db = HostDB()
+
+    servers = args.servers.split(',')
+    status_line = [""] * len(servers)  # line for status messages correct ANSI encoding
+
+    if any(server in RESERVE_WORDS for server in servers):
+        return do_db_actions(args, db)
+
+    current_futures = {}
+
+    def exit_gracefully(signum, frame):
+        print("\nInterrupted, closing.")
+        try:
+            exit_event.set()
+            # Terminate the pool
+            print("Shutting down executor...")
+            executor.shutdown(wait=False)
+
+            # Cancel all running futures
+            print("Cancelling futures...")
+            for f in current_futures.keys():
+                f.cancel()
+
+            print("Exiting...")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error in exit_gracefully: {e}")
+
+    # Set the signal handler
+    signal.signal(signal.SIGINT, exit_gracefully)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(servers)) as executor:
+        current_futures = {executor.submit(handle_single_server, server, args, db, i, status_line): server for i, server
+                           in enumerate(servers)}
+
+        try:
+            for future in concurrent.futures.as_completed(current_futures):
+                if exit_event.is_set():
+                    return
+                future.result()
+        except Exception as e:
+            print(f"Error with server {current_futures[future]}: {e}")
 
 
 if __name__ == "__main__":
