@@ -9,6 +9,7 @@ try:
     import time
     import json
     import uuid
+    import socket
     import xml.dom.minidom
     from xml.etree import ElementTree
 
@@ -485,7 +486,10 @@ def main():
     signal.signal(signal.SIGINT, exit_gracefully)
 
     threads = []
+    current_host = socket.gethostname()
     for i, server in enumerate(servers):
+        if server == current_host:
+            continue  # Skip the current server
         thread = threading.Thread(target=handle_single_server, args=(server, args, db, i, status_line, config))
         thread.daemon = True  # let the parent kill the child thread at exit
         threads.append(thread)
@@ -498,6 +502,8 @@ def main():
     while any(thread.is_alive() for thread in threads):
         for thread in threads:
             thread.join(1)  # time out not to block KeyboardInterrupt
+
+    print()
 
 
 if __name__ == "__main__":
