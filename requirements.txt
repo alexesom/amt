@@ -1,9 +1,6 @@
+pip
 appdirs
 termcolor
 requests~=2.31.0
 six
-
-pip~=21.3.1
-wheel~=0.37.1
-setuptools~=60.2.0
 urllib3~=2.0.3
