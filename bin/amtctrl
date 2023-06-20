@@ -460,7 +460,7 @@ def handle_single_server(server, args, db, i, status_line, config):
 def main():
     args = parse_args()
     db = HostDB()
-    with open('pass.json', 'r') as f:
+    with open('/eth/amtctrl.json', 'r') as f:
         config = json.load(f)
 
     servers = args.servers.split(',')
